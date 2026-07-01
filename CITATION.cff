@@ -1,0 +1,38 @@
+cff-version: 1.2.0
+message: >
+  If you use MolScreener in your research, please cite it using
+  the metadata below.
+
+title: MolScreener
+abstract: >
+  MolScreener is a server-ready compound library preparation tool for
+  virtual screening. It accepts vendor libraries in any common format
+  (ZIP, SDF, SDF.gz, SMILES, CSV) and produces filtered, named,
+  docking-ready inputs for GNINA / Vina (3D SDF) or Boltz-2
+  (co-folding YAML), preserving the original catalogue ID of every
+  compound throughout.
+
+authors:
+  - family-names: Lesgidou
+    given-names: Nastazia
+    affiliation: >
+      Department of Biomedical Engineering, University of West Attica (UniWA),
+      Athens, Greece
+    orcid: https://orcid.org/0009-0006-7200-0714
+
+version: "1.0"
+date-released: "2026-07-01"
+
+license: MIT
+repository-code: https://github.com/YOUR_USERNAME/MolScreener
+
+keywords:
+  - virtual screening
+  - drug discovery
+  - compound library preparation
+  - molecular docking
+  - GNINA
+  - Boltz-2
+  - cheminformatics
+  - GPCR
+  - computational chemistry

@@ -1,0 +1,12 @@
+# MolScreener — Python dependencies
+# Install with:  pip install -r requirements.txt
+#
+# OpenBabel is NOT a Python package — install it separately:
+#   Linux:  sudo apt install openbabel  (or conda install -c conda-forge openbabel)
+#   macOS:  brew install open-babel
+# If OpenBabel is absent, MolScreener falls back to RDKit ETKDG for 3D generation.
+
+rdkit>=2022.03.1
+PyYAML>=6.0
+rich>=13.0
+questionary>=2.0

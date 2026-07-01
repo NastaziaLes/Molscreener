@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# MolScreener outputs — never commit screening results to the repo
+*_gnina_part*.sdf
+*_boltz2_inputs/
+*_catalogue_index.tsv
+molscreener_output/
+molscreener_config.json
+
+# Large compound library files — too big for git
+*.sdf
+*.sdf.gz
+*.smi
+*.zip
+
+# Jupyter / IPython
+.ipynb_checkpoints/
+*.ipynb
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
