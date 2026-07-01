@@ -172,7 +172,7 @@ class RunConfig:
     mode:       OutputMode         = OutputMode.gnina
     output_dir: str                = ""
     n_cpus:     int                = max(1, TOTAL_CPUS - 1)
-    chunk_size: int                = 2000    # molecules per parallel task
+    chunk_size: int                = 500     # molecules per parallel task
     # GNINA options
     ph:         float              = 7.0
     batch_size: int                = 100_000  # molecules per output SDF part
@@ -602,15 +602,24 @@ def enumerate_chunks(library: LibraryEntry, chunk_size: int):
 def dispatch(chunks: Iterator, n_cpus: int, criteria: ScreeningCriteria,
              stop_flag: list[bool], progress_cb=None):
     """
-    Stream chunks to a process pool with a bounded in-flight window so memory
-    stays flat no matter how large the library is.  Yields (id, id_source, smiles).
+    Stream chunks to a process pool with a read-ahead buffer large enough
+    to keep all CPUs busy even when input comes from a single large file.
+
+    The read-ahead window is n_cpus * 4 — so with 20 CPUs, up to 80 chunks
+    are submitted at once.  Workers pick them up as they finish; the main
+    process keeps reading ahead to refill the queue.  Memory stays bounded
+    because each chunk holds at most chunk_size molecules.
     """
-    max_inflight = max(2, n_cpus * 2)
+    # 4× gives enough runway for the file reader to stay ahead of the workers.
+    # With a single large SDF and 20 CPUs, 2× was too small — workers finished
+    # chunks faster than the reader could produce the next one.
+    max_inflight = max(4, n_cpus * 4)
     it = iter(chunks)
     done = 0
 
     with concurrent.futures.ProcessPoolExecutor(max_workers=n_cpus) as pool:
         inflight = set()
+        # Pre-fill the entire window before waiting for any result
         for _ in range(max_inflight):
             try:
                 inflight.add(pool.submit(worker_process_chunk, next(it), criteria))
@@ -633,6 +642,7 @@ def dispatch(chunks: Iterator, n_cpus: int, criteria: ScreeningCriteria,
                 for f in inflight:
                     f.cancel()
                 break
+            # Refill: for every slot that freed up, read ahead one more chunk
             for _ in range(len(completed)):
                 try:
                     inflight.add(pool.submit(worker_process_chunk, next(it), criteria))
@@ -1302,8 +1312,8 @@ def tui_collect_compute() -> tuple[int, int]:
         n = default_cpus
     try:
         chunk = int(_q(questionary.text,
-                       "  Molecules per parallel task (chunk size)  [2000]:",
-                       default="2000"))
+                       "  Molecules per parallel task (chunk size)  [500]:",
+                       default="500"))
         chunk = max(100, chunk)
     except (ValueError, TypeError):
         chunk = 2000
@@ -1589,8 +1599,8 @@ Examples
     parser.add_argument("--mode", choices=["gnina", "boltz2"], default="gnina")
     parser.add_argument("--output", metavar="DIR", help="Output directory")
     parser.add_argument("--cpus", type=int, help=f"CPUs to use (max {TOTAL_CPUS})")
-    parser.add_argument("--chunk", type=int, default=2000,
-        help="Molecules per parallel task (default 2000)")
+    parser.add_argument("--chunk", type=int, default=500,
+        help="Molecules per parallel task (default 500)")
     parser.add_argument("--ph", type=float, default=7.0,
         help="Protonation pH for GNINA mode (default 7.0)")
     parser.add_argument("--batch", type=int, default=100_000,
@@ -1610,4 +1620,10 @@ Examples
 
 if __name__ == "__main__":
     multiprocessing.freeze_support()
+    # On macOS (Python ≥ 3.8) the default start method is 'spawn', which
+    # requires this guard to be present — otherwise worker processes
+    # re-import the script and silently fall back to a single CPU.
+    # Setting it explicitly here ensures correct behaviour on macOS, Linux,
+    # and HPC clusters regardless of the system default.
+    multiprocessing.set_start_method("spawn", force=True)
     main()
