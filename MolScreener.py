@@ -152,6 +152,14 @@ class ScreeningCriteria:
     min_stereo: int = 0;      max_stereo: int = 4
     remove_pains: bool = True
     remove_brenk: bool = True
+    # ── Synthesizability / element / halogen filters (v3) ────────────
+    check_elements:    bool  = True   # restrict to allowed atomic symbols
+    allowed_elements:  str   = "C,H,N,O,S,F,Cl,Br"  # comma-separated
+    max_f_count:       int   = 4      # max fluorine atoms
+    max_cl_count:      int   = 2      # max chlorine atoms
+    max_br_count:      int   = 2      # max bromine atoms
+    max_peptide_bonds: int   = 2      # max amide (peptide) bonds
+    max_basic_n:       int   = 1      # max basic nitrogen atoms (pKa > 7)
 
 @dataclass
 class Boltz2Config:
@@ -321,6 +329,50 @@ def _passes(mol, c: ScreeningCriteria, pains_cat, brenk_cat) -> bool:
             if not (c.min_sa <= sa <= c.max_sa): return False
         except Exception:
             pass
+
+    # ── Element whitelist ────────────────────────────────────────────
+    if c.check_elements:
+        allowed = set(sym.strip() for sym in c.allowed_elements.split(",") if sym.strip())
+        for atom in mol.GetAtoms():
+            if atom.GetSymbol() not in allowed:
+                return False
+
+    # ── Per-halogen count limits ─────────────────────────────────────
+    atom_syms = [a.GetSymbol() for a in mol.GetAtoms()]
+    if atom_syms.count("F")  > c.max_f_count:  return False
+    if atom_syms.count("Cl") > c.max_cl_count: return False
+    if atom_syms.count("Br") > c.max_br_count: return False
+
+    # ── Peptide-bond (amide N-C=O) count ────────────────────────────
+    # SMARTS: amide bond N-C(=O) — counts each occurrence
+    _amide_smarts = Chem.MolFromSmarts("[NX3;H0,H1,H2]-C(=O)")
+    if _amide_smarts is not None:
+        n_peptide = len(mol.GetSubstructMatches(_amide_smarts))
+        if n_peptide > c.max_peptide_bonds:
+            return False
+
+    # ── Basic nitrogen count (protonated at physiological pH, pKa > ~7) ──
+    # Counts sp3 amines only. Explicitly EXCLUDES nitrogens that are not
+    # basic at pH 7.4, which a naive "non-aromatic NX3" pattern wrongly
+    # counts:
+    #   !$(N-a)            anilines and N-aryl piperazine/morpholine/
+    #                      piperidine (pKa ~4-5, neutral at pH 7.4) — these
+    #                      motifs are extremely common in vendor libraries,
+    #                      so counting them massively over-rejects
+    #   !$(NC=O) !$(NS=O)  amides, sulfonamides
+    #   !$(N[C,S]=[O,S,N]) ureas, thioamides, amidine-type
+    #   !$(N~[F,Cl,Br,I])  N-halogen
+    #   !$(N#*)            nitriles/isocyanides
+    #   !a                 aromatic N (pyrrole/pyridine ring atoms)
+    # Note: nitro N is also excluded via the N[C,S]=[O,S,N] / charge rules.
+    _basic_n_smarts = Chem.MolFromSmarts(
+        "[NX3;H0,H1,H2;!$(NC=O);!$(NS=O);!$(N~[F,Cl,Br,I]);"
+        "!$(N-a);!$(N[C,S]=[O,S,N]);!$(N#*);!a]"
+    )
+    if _basic_n_smarts is not None:
+        n_basic = len(mol.GetSubstructMatches(_basic_n_smarts))
+        if n_basic > c.max_basic_n:
+            return False
 
     if pains_cat and pains_cat.HasMatch(mol): return False
     if brenk_cat and brenk_cat.HasMatch(mol): return False
@@ -721,9 +773,37 @@ def make_boltz2_yaml(smiles: str, cfg: Boltz2Config) -> str:
                      default_flow_style=False)
 
 
+def _gen3d_worker(task):
+    """
+    Top-level, picklable worker for parallel 3D conformer generation.
+
+    task = (cid, id_source, smiles, ph, use_ob)
+    Returns (cid, id_source, smiles, sdf_block_or_None)
+
+    Each call shells out to OpenBabel (or falls back to RDKit ETKDG), which is
+    by far the most expensive step in GNINA mode — this is what needs the CPUs,
+    not the descriptor filtering.
+    """
+    cid, id_source, smiles, ph, use_ob = task
+    try:
+        block = smiles_to_3d_sdf(smiles, cid, ph, use_ob)
+    except Exception:
+        block = None
+    return (cid, id_source, smiles, block)
+
+
 def write_gnina(stream, out_dir, lib_label, ph, batch_size,
-                stop_flag, progress_cb=None) -> tuple[int, int, int]:
-    """Returns (saved, failed_3d, fallback_ids)."""
+                stop_flag, progress_cb=None, n_cpus: int = 1) -> tuple[int, int, int]:
+    """
+    Generate 3D conformers IN PARALLEL and stream them to batched SDF files.
+
+    The filtered-molecule stream is fed to a process pool with a bounded
+    read-ahead window (n_cpus * 4), exactly like the filtering stage. Results
+    are written by the main process as they complete, so memory stays flat and
+    the SDF/TSV stay consistent regardless of library size.
+
+    Returns (saved, failed_3d, fallback_ids).
+    """
     use_ob = bool(shutil.which(OPENBABEL))
     if not use_ob:
         _log("warn", "obabel not found — using RDKit ETKDG (no pH correction)")
@@ -736,28 +816,73 @@ def write_gnina(stream, out_dir, lib_label, ph, batch_size,
     part, in_part = 1, 0
     part_name = f"{lib_label}_gnina_part{part}.sdf"
     fh = open(os.path.join(out_dir, part_name), "w", encoding="utf-8")
-    try:
+
+    n_cpus = max(1, int(n_cpus))
+    max_inflight = max(4, n_cpus * 4)
+
+    def tasks():
         for cid, id_source, smiles in stream:
-            if stop_flag[0]:
-                break
-            if id_source == "fallback":
-                fallback += 1
-            block = smiles_to_3d_sdf(smiles, cid, ph, use_ob)
-            if block is None:
-                tsv.write(f"{cid}\t{id_source}\t{smiles}\tFAILED_3D_GEN\n")
-                failed += 1
-                continue
-            fh.write(block)
-            tsv.write(f"{cid}\t{id_source}\t{smiles}\t{part_name}\n")
-            saved += 1
-            in_part += 1
-            if in_part >= batch_size:
-                fh.flush(); fh.close()
-                part += 1; in_part = 0
-                part_name = f"{lib_label}_gnina_part{part}.sdf"
-                fh = open(os.path.join(out_dir, part_name), "w", encoding="utf-8")
-            if progress_cb:
-                progress_cb(saved, failed, cid)
+            yield (cid, id_source, smiles, ph, use_ob)
+
+    it = iter(tasks())
+
+    try:
+        with concurrent.futures.ProcessPoolExecutor(max_workers=n_cpus) as pool:
+            inflight = set()
+            # Pre-fill the read-ahead window so every CPU has work immediately
+            for _ in range(max_inflight):
+                try:
+                    inflight.add(pool.submit(_gen3d_worker, next(it)))
+                except StopIteration:
+                    break
+
+            while inflight:
+                completed, inflight = concurrent.futures.wait(
+                    inflight, return_when=concurrent.futures.FIRST_COMPLETED)
+
+                for fut in completed:
+                    try:
+                        cid, id_source, smiles, block = fut.result()
+                    except Exception as ex:
+                        print(f"  [!] 3D worker error: {ex}", file=sys.stderr)
+                        continue
+
+                    if id_source == "fallback":
+                        fallback += 1
+
+                    if block is None:
+                        tsv.write(f"{cid}\t{id_source}\t{smiles}\tFAILED_3D_GEN\n")
+                        failed += 1
+                        continue
+
+                    fh.write(block)
+                    tsv.write(f"{cid}\t{id_source}\t{smiles}\t{part_name}\n")
+                    saved += 1
+                    in_part += 1
+
+                    if in_part >= batch_size:
+                        fh.flush(); fh.close()
+                        part += 1; in_part = 0
+                        part_name = f"{lib_label}_gnina_part{part}.sdf"
+                        fh = open(os.path.join(out_dir, part_name), "w",
+                                  encoding="utf-8")
+
+                    if saved % 200 == 0:
+                        tsv.flush()
+                    if progress_cb:
+                        progress_cb(saved, failed, cid)
+
+                if stop_flag[0]:
+                    for f in inflight:
+                        f.cancel()
+                    break
+
+                # Refill one task per freed slot
+                for _ in range(len(completed)):
+                    try:
+                        inflight.add(pool.submit(_gen3d_worker, next(it)))
+                    except StopIteration:
+                        break
     finally:
         fh.flush(); fh.close()
         tsv.flush(); tsv.close()
@@ -869,8 +994,26 @@ def run_pipeline(cfg: RunConfig, stop_flag: list[bool]) -> None:
         def filter_cb(done, lbl=prefix):
             _progress(f"{lbl}: filtered {done} chunk(s)…")
 
+        # In GNINA mode two process pools are alive at the same time: the
+        # filtering pool (dispatch is a generator, so its pool stays open while
+        # its output is consumed) and the 3D-generation pool inside write_gnina.
+        # Descriptor filtering is cheap; OpenBabel 3D generation is the real
+        # bottleneck, so give filtering a small slice and 3D the rest. Without
+        # this split each pool would take cfg.n_cpus workers and oversubscribe
+        # the machine 2x.
+        if cfg.mode == OutputMode.gnina:
+            filter_cpus = max(1, min(4, cfg.n_cpus // 4))
+            gen3d_cpus  = max(1, cfg.n_cpus - filter_cpus)
+        else:
+            filter_cpus = cfg.n_cpus
+            gen3d_cpus  = cfg.n_cpus
+
+        if cfg.mode == OutputMode.gnina:
+            _log("info", f"{prefix}: {filter_cpus} CPU(s) filtering + "
+                         f"{gen3d_cpus} CPU(s) generating 3D conformers")
+
         chunks = enumerate_chunks(lib, cfg.chunk_size)
-        stream = dispatch(chunks, cfg.n_cpus, cfg.criteria, stop_flag, filter_cb)
+        stream = dispatch(chunks, filter_cpus, cfg.criteria, stop_flag, filter_cb)
 
         if cfg.mode == OutputMode.gnina:
             def gnina_cb(saved, failed, cid):
@@ -879,7 +1022,8 @@ def run_pipeline(cfg: RunConfig, stop_flag: list[bool]) -> None:
                           + f"   · last ID: {cid}")
             saved, failed, fb = write_gnina(
                 stream, cfg.output_dir, lib.label,
-                cfg.ph, cfg.batch_size, stop_flag, gnina_cb)
+                cfg.ph, cfg.batch_size, stop_flag, gnina_cb,
+                n_cpus=gen3d_cpus)
             rec.update(kept=saved, failed=failed, fallback=fb)
             _erase_progress()
             _log("ok", f"{prefix}: {saved:,} molecules → 3D SDF"
